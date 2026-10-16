@@ -25,7 +25,11 @@ esac
 BUILD="x86_64-unknown-linux-gnu"
 MAKE_CFLAGS="-O2"
 MAKE_CXXFLAGS="-O2"
-MAKE_LDFLAGS="-static -static-libgcc -static-libstdc++"
+# Verilator's AST passes recurse deeply.  The Windows default stack is 1 MB
+# (Linux: 8 MB), and the ARM64 build died with STATUS_STACK_OVERFLOW (0xC00000FD)
+# right after parsing even a trivial module.  Reserve 256 MB (virtual only).
+STACK_BYTES=268435456
+MAKE_LDFLAGS="-static -static-libgcc -static-libstdc++ -Wl,--stack,$STACK_BYTES"
 J=$(($(nproc) - 1))
 [ "$J" -lt 1 ] && J=1
 
@@ -268,9 +272,19 @@ patch_mk() {
     sed -i 's|x86_64-w64-mingw32-ar|ar|g'          "$MK"
     sed -i 's|x86_64-w64-mingw32-nm|nm|g'          "$MK"
     sed -i 's|x86_64-w64-mingw32-strip|strip|g'    "$MK"
-    sed -i 's|aarch64-w64-mingw32-clang++|clang++|g' "$MK"
-    sed -i 's|aarch64-w64-mingw32-clang|clang|g'     "$MK"
+    # The arm64 package is built with clang, but the documented runtime
+    # toolchain is w64devkit (g++), so the generated makefiles must use g++.
+    sed -i 's|aarch64-w64-mingw32-clang++|g++|g' "$MK"
+    sed -i 's|aarch64-w64-mingw32-clang|gcc|g'   "$MK"
+    sed -i -E 's/^(CXX|LINK) *= *clang\+\+/\1 = g++/; s/^CC *= *clang$/CC = gcc/' "$MK"
     sed -i 's|llvm-ar|ar|g; s|llvm-nm|nm|g; s|llvm-strip|strip|g' "$MK"
+
+    # clang-only flags recorded by configure when built with clang; g++ rejects them
+    sed -i -E 's/-fbracket-depth=[0-9]+//g; s/-Xclang +-fno-pch-timestamp//g; s/-Qunused-arguments//g' "$MK"
+    sed -i -E 's/-Wno-(c\+\+11-narrowing|constant-logical-operand|non-pod-varargs|parentheses-equality|vla-cxx-extension|tautological-bitwise-compare)//g' "$MK"
+    # clang PCH syntax (-include-pch X.gch) does not exist for g++; with g++ the
+    # PCH is just skipped.  "-MT <name>" consumes the PCH file name harmlessly.
+    sed -i 's|^CFG_CXXFLAGS_PCH_I *=.*|CFG_CXXFLAGS_PCH_I = -MT|' "$MK"
 
     # Replace PYTHON3 variable default — point to our .bat wrapper
     sed -i 's|^PYTHON3 \?=.*|PYTHON3 ?= $(VERILATOR_ROOT)/bin/python3_find.bat|g' "$MK"
@@ -502,9 +516,6 @@ IF EXIST "%~dp0..\include\verilated.mk" (
 :: g++ (w64devkit)
 WHERE g++ >nul 2>&1
 IF %ERRORLEVEL%==0 (
-    FOR /F "tokens=*" %%V IN ('g++ --version 2^>nul ^| findstr /r "[0-9]"') DO (
-        echo [PASS] g++ = %%V & GOTO :gpp_done
-    )
     echo [PASS] g++ found
 ) ELSE (
     echo [FAIL] g++ NOT found - install w64devkit
@@ -532,12 +543,12 @@ IF %ERRORLEVEL%==0 (
 :: Python
 WHERE python3 >nul 2>&1
 IF %ERRORLEVEL%==0 (
-    FOR /F "tokens=*" %%V IN ('python3 --version 2^>nul') DO echo [PASS] %%V
+    echo [PASS] python3 found
     GOTO :py_done
 )
 WHERE python >nul 2>&1
 IF %ERRORLEVEL%==0 (
-    FOR /F "tokens=*" %%V IN ('python --version 2^>nul') DO echo [WARN] python (no python3 alias): %%V
+    echo [WARN] python found, but no python3 alias
     GOTO :py_done
 )
 echo [FAIL] Python NOT found - install from https://www.python.org
@@ -681,6 +692,15 @@ check "share/verilator/verilated.mk" "$PKG/share/verilator/include/verilated.mk"
 check "README_WINDOWS.txt"          "$PKG/README_WINDOWS.txt"
 check "package.json"                "$PKG/package.json"
 check "tarball"                     "$TARBALL"
+
+# Stack reserve check (regression guard for the ARM64 stack overflow)
+STACK_HEX=$(printf '%x' "$STACK_BYTES")
+if "$OBJDUMP" -p "$PKG/bin/verilator.exe" 2>/dev/null \
+    | grep -i "SizeOfStackReserve" | grep -qi "$STACK_HEX"; then
+    echo "  [PASS] SizeOfStackReserve = $STACK_BYTES"
+else
+    echo "  [FAIL] SizeOfStackReserve is not $STACK_BYTES"; FAIL=1
+fi
 
 # PE32+ check
 file "$PKG/bin/verilator.exe" | grep -q "PE32+" \
