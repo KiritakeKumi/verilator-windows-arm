@@ -8,14 +8,20 @@ set -o pipefail
 # ══════════════════════════════════════════════════════════════
 #  CONFIGURATION
 # ══════════════════════════════════════════════════════════════
-ARCH=windows_amd64
+# Target: windows_amd64 (default, GNU mingw-w64) or windows_arm64 (llvm-mingw)
+ARCH="${TARGET_ARCH:-windows_amd64}"
+LLVM_MINGW_VERSION="${LLVM_MINGW_VERSION:-20240619}"
 NAME=verilator-windows
 WORK_DIR=$PWD
 UPSTREAM_DIR=$WORK_DIR/_upstream
 PACKAGE_DIR=$WORK_DIR/_packages/build_$ARCH
 PKG=$PACKAGE_DIR/$NAME
 EXE=".exe"
-HOST="x86_64-w64-mingw32"
+case "$ARCH" in
+    windows_amd64) HOST="x86_64-w64-mingw32" ;;
+    windows_arm64) HOST="aarch64-w64-mingw32" ;;
+    *) echo "ERROR: unsupported TARGET_ARCH '$ARCH'"; exit 1 ;;
+esac
 BUILD="x86_64-unknown-linux-gnu"
 MAKE_CFLAGS="-O2"
 MAKE_CXXFLAGS="-O2"
@@ -40,8 +46,10 @@ sudo apt-get install -y \
     build-essential bison flex gperf \
     autoconf automake libtool \
     git help2man perl python3 make rsync curl \
-    libfl-dev libfl2 zlib1g-dev \
-    mingw-w64 mingw-w64-tools mingw-w64-x86-64-dev
+    libfl-dev libfl2 zlib1g-dev file xz-utils
+if [ "$ARCH" = "windows_amd64" ]; then
+    sudo apt-get install -y mingw-w64 mingw-w64-tools mingw-w64-x86-64-dev
+fi
 
 # ══════════════════════════════════════════════════════════════
 #  STEP 2 — Configure cross-compiler
@@ -50,6 +58,23 @@ sudo apt-get install -y \
 # ══════════════════════════════════════════════════════════════
 echo "[2/9] Configuring cross-compiler..."
 
+if [ "$ARCH" = "windows_arm64" ]; then
+    # Ubuntu's mingw-w64 has no ARM64 target; use the llvm-mingw toolchain
+    LLVM_MINGW_DIR="$WORK_DIR/_llvm-mingw"
+    if [ ! -x "$LLVM_MINGW_DIR/bin/$HOST-clang" ]; then
+        rm -rf "$LLVM_MINGW_DIR"; mkdir -p "$LLVM_MINGW_DIR"
+        LLVM_TAR="llvm-mingw-${LLVM_MINGW_VERSION}-ucrt-ubuntu-20.04-x86_64.tar.xz"
+        curl -fL "https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_VERSION}/${LLVM_TAR}" \
+            | tar -xJ -C "$LLVM_MINGW_DIR" --strip-components=1
+    fi
+    export PATH="$LLVM_MINGW_DIR/bin:$PATH"
+    export CC="$HOST-clang"
+    export CXX="$HOST-clang++"
+    export AR="llvm-ar"
+    export RANLIB="llvm-ranlib"
+    export STRIP="llvm-strip"
+    export NM="llvm-nm"
+else
 GCC_POSIX=$(ls /usr/bin/x86_64-w64-mingw32-gcc-posix 2>/dev/null \
          || ls /usr/bin/x86_64-w64-mingw32-gcc-*posix* 2>/dev/null | head -1 \
          || echo "x86_64-w64-mingw32-gcc")
@@ -68,6 +93,9 @@ export AR="$HOST-ar"
 export RANLIB="$HOST-ranlib"
 export STRIP="$HOST-strip"
 export NM="$HOST-nm"
+fi
+OBJDUMP="$OBJDUMP"
+command -v "$OBJDUMP" >/dev/null 2>&1 || OBJDUMP=llvm-objdump
 
 echo "  CC  = $CC  ($($CC  --version | head -1))"
 echo "  CXX = $CXX ($($CXX --version | head -1))"
@@ -240,6 +268,9 @@ patch_mk() {
     sed -i 's|x86_64-w64-mingw32-ar|ar|g'          "$MK"
     sed -i 's|x86_64-w64-mingw32-nm|nm|g'          "$MK"
     sed -i 's|x86_64-w64-mingw32-strip|strip|g'    "$MK"
+    sed -i 's|aarch64-w64-mingw32-clang++|clang++|g' "$MK"
+    sed -i 's|aarch64-w64-mingw32-clang|clang|g'     "$MK"
+    sed -i 's|llvm-ar|ar|g; s|llvm-nm|nm|g; s|llvm-strip|strip|g' "$MK"
 
     # Replace PYTHON3 variable default — point to our .bat wrapper
     sed -i 's|^PYTHON3 \?=.*|PYTHON3 ?= $(VERILATOR_ROOT)/bin/python3_find.bat|g' "$MK"
@@ -361,8 +392,9 @@ FOR %%I IN ("%BIN_DIR%\..") DO SET "VERILATOR_ROOT=%%~fI"
 
 :: Guard: must use w64devkit (g++ + make + sh)
 WHERE g++ >nul 2>&1
+IF %ERRORLEVEL% NEQ 0 WHERE clang++ >nul 2>&1
 IF %ERRORLEVEL% NEQ 0 (
-    echo ERROR: g++ not found.
+    echo ERROR: g++ or clang++ not found.
     echo Open w64devkit terminal: https://github.com/skeeto/w64devkit/releases
     exit /b 1
 )
@@ -615,7 +647,7 @@ cat > "$PKG/package.json" << PKGJSONEOF
   "description": "Verilator HDL simulator for Windows (w64devkit)",
   "url":         "https://github.com/withlimon/verilator-windows",
   "version":     "$VERSION",
-  "system":      ["windows", "windows_amd64"]
+  "system":      ["windows", "$ARCH"]
 }
 PKGJSONEOF
 
@@ -672,11 +704,11 @@ fi
 
 # DLL dependency check
 echo "  [INFO] DLL dependencies:"
-"$HOST-objdump" -p "$PKG/bin/verilator.exe" 2>/dev/null \
+"$OBJDUMP" -p "$PKG/bin/verilator.exe" 2>/dev/null \
     | grep "DLL Name" | sed 's/^/          /' || echo "          (none or can't read)"
 
 # Static check
-if "$HOST-objdump" -p "$PKG/bin/verilator.exe" 2>/dev/null \
+if "$OBJDUMP" -p "$PKG/bin/verilator.exe" 2>/dev/null \
     | grep -qi "libgcc\|libstdc\+\+"; then
     echo "  [WARN] Dynamic libgcc/libstdc++ dependency — may need DLLs"
 else
@@ -684,7 +716,7 @@ else
 fi
 
 # Check for winpthread (should be static)
-if "$HOST-objdump" -p "$PKG/bin/verilator.exe" 2>/dev/null \
+if "$OBJDUMP" -p "$PKG/bin/verilator.exe" 2>/dev/null \
     | grep -qi "winpthread"; then
     echo "  [INFO] winpthread found (static threading support)"
 fi
